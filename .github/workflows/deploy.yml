@@ -18,13 +18,14 @@ jobs:
 
       - name: Empaquetar función
         run: zip -r function.zip . -x "*.git*" -x ".github/*"
-
+        
       - name: Configurar credenciales AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::688066488480:role/github-actions-whatsapp-agente-lambda-deploy
           aws-region: us-east-2
-
+          role-skip-session-tagging: true
+          
       - name: Desplegar a Lambda
         run: |
           aws lambda update-function-code \
