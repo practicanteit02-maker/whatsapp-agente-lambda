@@ -1,0 +1,32 @@
+name: Deploy Lambda
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Empaquetar función
+        run: zip -r function.zip . -x "*.git*" -x ".github/*"
+
+      - name: Configurar credenciales AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::688066488480:role/github-actions-whatsapp-agente-lambda-deploy
+          aws-region: us-east-2
+
+      - name: Desplegar a Lambda
+        run: |
+          aws lambda update-function-code \
+            --function-name whatsapp-agente-test \
+            --zip-file fileb://function.zip
