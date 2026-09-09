@@ -5,6 +5,7 @@ import { DynamoDBDocumentClient, GetCommand, PutCommand } from '@aws-sdk/lib-dyn
 const ssmClient = new SSMClient({});
 const dynamoClient = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const NOMBRE_TABLA = 'conversaciones-whatsapp';
+const NOMBRE_TABLA_CONFIG = 'conversaciones-ai-config';
 const MAX_MENSAJES_HISTORIAL = 10;
 
 async function obtenerParametro(nombre) {
@@ -33,6 +34,31 @@ async function guardarHistorial(numeroTelefono, historial) {
     },
   });
   await dynamoClient.send(command);
+}
+
+function construirThreadKey(phoneNumberId, phoneNumber, businessScopedUserId) {
+  let contactKey;
+  if (businessScopedUserId && String(businessScopedUserId).trim()) {
+    contactKey = `bsuid:${String(businessScopedUserId).trim()}`;
+  } else {
+    const soloDigitos = String(phoneNumber || '').replace(/\D/g, '');
+    contactKey = soloDigitos || String(phoneNumber || '');
+  }
+  return `${phoneNumberId}:${contactKey}`;
+}
+
+async function obtenerAiEnabled(threadKey) {
+  try {
+    const command = new GetCommand({
+      TableName: NOMBRE_TABLA_CONFIG,
+      Key: { threadKey },
+    });
+    const response = await dynamoClient.send(command);
+    return response.Item?.aiEnabled === true;
+  } catch (error) {
+    console.error('Error consultando conversaciones-ai-config:', error);
+    return false;
+  }
 }
 
 async function preguntarAGemini(apiKey, historial) {
@@ -88,6 +114,10 @@ export const handler = async (event) => {
     const textoRecibido = body.message?.text?.body;
     const numero = body.conversation?.phone_number;
     const phoneNumberId = body.phone_number_id;
+    const businessScopedUserId =
+      body.contact?.business_scoped_user_id ??
+      body.conversation?.contact?.business_scoped_user_id ??
+      body.message?.business_scoped_user_id;
 
     if (body.message?.kapso?.direction === 'outbound') {
       return { statusCode: 200, body: JSON.stringify({ status: 'ignorado_outbound' }) };
@@ -95,6 +125,13 @@ export const handler = async (event) => {
 
     if (!textoRecibido || !numero || !phoneNumberId) {
       return { statusCode: 200, body: JSON.stringify({ status: 'ignorado' }) };
+    }
+
+    const threadKey = construirThreadKey(phoneNumberId, numero, businessScopedUserId);
+    const iaActiva = await obtenerAiEnabled(threadKey);
+    if (!iaActiva) {
+      console.log(`IA desactivada para threadKey=${threadKey}`);
+      return { statusCode: 200, body: JSON.stringify({ status: 'ia_desactivada' }) };
     }
 
     console.log(`Mensaje de ${numero}: "${textoRecibido}"`);
