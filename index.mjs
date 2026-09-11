@@ -156,7 +156,12 @@ const INSTRUCCION_SISTEMA =
   'que no tiene relación con la empresa (temas de cultura general, chistes, temas ' +
   'personales u otros temas random), respóndele con amabilidad que no puedes ayudarle ' +
   'con eso, y ofrécele ayuda con algo relacionado con la empresa en su lugar. No seas ' +
-  'cortante ni suenes robótico.';
+  'cortante ni suenes robótico. ' +
+  'Responde siempre de forma breve: máximo 2-3 líneas por mensaje, sin párrafos largos. ' +
+  'Ve directo a la respuesta, sin introducciones ni relleno. No agregues sugerencias, ' +
+  'alternativas ni datos que el cliente no pidió (por ejemplo, no recomiendes otras ' +
+  'apps, servicios o webs externas). Si el tema requiere más detalle del que cabe en ' +
+  'pocas líneas, da lo esencial y ofrece seguir explicando si el cliente lo pide.';
 
 async function preguntarAGemini(apiKey, historial) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${apiKey}`;
