@@ -145,6 +145,19 @@ async function obtenerAiEnabled(threadKey) {
   }
 }
 
+// Limita el rol de la IA a consultas de la empresa: la API de Gemini
+// (generateContent, v1beta) acepta "systemInstruction" como campo separado
+// de "contents" — un Content de solo texto que no cuenta como turno del
+// historial. Se manda en cada llamada porque el endpoint es sin estado.
+const INSTRUCCION_SISTEMA =
+  'Eres un asistente de atención al cliente de esta empresa. Tu rol es ayudar ' +
+  'únicamente con consultas relacionadas con la empresa y su negocio (productos, ' +
+  'servicios, pedidos, horarios, precios, soporte, etc.). Si el cliente pregunta algo ' +
+  'que no tiene relación con la empresa (temas de cultura general, chistes, temas ' +
+  'personales u otros temas random), respóndele con amabilidad que no puedes ayudarle ' +
+  'con eso, y ofrécele ayuda con algo relacionado con la empresa en su lugar. No seas ' +
+  'cortante ni suenes robótico.';
+
 async function preguntarAGemini(apiKey, historial) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${apiKey}`;
 
@@ -152,7 +165,10 @@ async function preguntarAGemini(apiKey, historial) {
     const response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ contents: historial }),
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: INSTRUCCION_SISTEMA }] },
+        contents: historial,
+      }),
     });
     const data = await response.json();
 
