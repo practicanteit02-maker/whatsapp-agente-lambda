@@ -281,9 +281,16 @@ async function preguntarAGemini(apiKey, historial) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${apiKey}`;
 
   for (let intento = 1; intento <= 3; intento++) {
+    // Diagnóstico: visibilidad de en qué intento estamos y qué pasó en cada
+    // uno, para saber si el fallback sale desde el primer intento o recién
+    // después de agotar los 3 — sin esto, el log solo mostraba el texto
+    // final de la respuesta (o del fallback), sin ninguna pista del motivo.
+    console.log(`Gemini: intento ${intento} de 3...`);
+
     let data;
+    let response;
     try {
-      const response = await fetchConTimeout(url, {
+      response = await fetchConTimeout(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -298,15 +305,31 @@ async function preguntarAGemini(apiKey, historial) {
       // llamada ya tardó demasiado, reintentar solo vuelve a arriesgar el
       // mismo presupuesto de tiempo que causó el timeout de 30s original.
       // Se responde el fallback ya, sin gastar los intentos restantes.
-      console.error(`Gemini: intento ${intento} falló (timeout o red):`, error.message);
+      const fueTimeoutPropio = error.name === 'AbortError';
+      console.error(
+        `Gemini: intento ${intento} de 3 falló con excepción` +
+        (fueTimeoutPropio ? ` (TIMEOUT propio a los ${GEMINI_TIMEOUT_MS}ms, GEMINI_TIMEOUT_MS)` : ' (red u otro error, no fue nuestro timeout)') +
+        ` — name=${error.name}, message=${error.message}`
+      );
       return 'Lo siento, no pude generar una respuesta en este momento.';
     }
 
     if (data.candidates?.[0]?.content?.parts?.[0]?.text) {
+      console.log(`Gemini: intento ${intento} de 3 OK (status HTTP ${response.status})`);
       return data.candidates[0].content.parts[0].text;
     }
 
+    // Gemini respondió (no hubo excepción ni timeout) pero sin texto válido
+    // en candidates[0].content.parts[0].text — logueamos el status HTTP y el
+    // body completo para ver si vino un código de error (429, 503, ...) o
+    // algún motivo explícito de Google (p.ej. un bloqueo por safety, o
+    // finishReason distinto de STOP) antes de decidir si se reintenta.
+    console.error(
+      `Gemini: intento ${intento} de 3 sin texto válido — status HTTP ${response.status}, body=${JSON.stringify(data)}`
+    );
+
     if (data.error?.code === 503 && intento < 3) {
+      console.log(`Gemini: intento ${intento} de 3 fue 503, esperando 1.5s antes de reintentar...`);
       await new Promise((resolve) => setTimeout(resolve, 1500));
       continue;
     }
