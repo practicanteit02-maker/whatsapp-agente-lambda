@@ -10,12 +10,12 @@ const MAX_MENSAJES_HISTORIAL = 10;
 
 // Corrección del bug "timeout de 30s + respuestas duplicadas": ninguna de
 // las 3 llamadas fetch() externas de este archivo (Kapso conversations.get,
-// Gemini, Kapso messages) tenía timeout propio — el fetch() global de Node
-// no lo tiene por defecto, así que si el servidor remoto no respondía (o
-// tardaba más de la cuenta), la función se quedaba esperando hasta que
-// Lambda la mataba a la fuerza en su propio límite (30s) sin haber llegado
-// a responderle nada ni a Kapso ni al cliente. Como Kapso además reintenta
-// el webhook si no recibe un 200 en 10s (ver
+// el proveedor de IA, Kapso messages) tenía timeout propio — el fetch()
+// global de Node no lo tiene por defecto, así que si el servidor remoto no
+// respondía (o tardaba más de la cuenta), la función se quedaba esperando
+// hasta que Lambda la mataba a la fuerza en su propio límite (30s) sin haber
+// llegado a responderle nada ni a Kapso ni al cliente. Como Kapso además
+// reintenta el webhook si no recibe un 200 en 10s (ver
 // .agents/skills/integrate-whatsapp/references/webhooks-overview.md del
 // panel), un colgado de 30s ya alcanzaba para que Kapso disparara una
 // segunda invocación mucho antes — de ahí los duplicados.
@@ -25,15 +25,18 @@ const MAX_MENSAJES_HISTORIAL = 10;
 // responder con el mensaje de fallback (o seguir con el teléfono solo en
 // resolverThreadKey) en vez de agotar el timeout completo de Lambda.
 //
-// Gemini tiene su propia cota más alta (GEMINI_TIMEOUT_MS): un incidente
-// real mostró que 8s le quedaba corto a Gemini incluso cuando SÍ iba a
-// responder — abortaba de más. Kapso (conversations.get y el envío del
-// mensaje) se queda en 8s porque nunca mostró ese problema y suele
-// responder rápido. Como un abort ya no reintenta (ver preguntarAGemini),
-// el peor caso de esa función sigue siendo un solo intento de 20s, no
-// 3×20s — la cuenta contra el timeout de 45s de la función sigue cerrando.
+// La llamada al modelo de IA tiene su propia cota más alta (GROQ_TIMEOUT_MS,
+// heredada de cuando este valor se llamaba GEMINI_TIMEOUT_MS): un incidente
+// real con el proveedor anterior (Gemini) mostró que 8s le quedaba corto
+// incluso cuando SÍ iba a responder — abortaba de más. Se mantiene el mismo
+// valor más alto para el proveedor actual (Groq) por las dudas, aunque Groq
+// suele responder más rápido. Kapso (conversations.get y el envío del
+// mensaje) se queda en 8s porque nunca mostró ese problema y suele responder
+// rápido. Como un abort ya no reintenta (ver preguntarAGroq), el peor caso de
+// esa función sigue siendo un solo intento de 20s, no 3×20s — la cuenta
+// contra el timeout de 45s de la función sigue cerrando.
 const FETCH_TIMEOUT_MS = 8000;
-const GEMINI_TIMEOUT_MS = 20000;
+const GROQ_TIMEOUT_MS = 20000;
 
 async function fetchConTimeout(url, options, timeoutMs = FETCH_TIMEOUT_MS) {
   const controller = new AbortController();
@@ -182,17 +185,21 @@ async function obtenerAiEnabled(threadKey) {
   }
 }
 
-// Lock compartido entre esta Lambda (Gemini) y WhatsApp-Agentico (Groq, ver
+// Lock compartido entre esta Lambda y WhatsApp-Agentico (ver
 // src/lib/chat-ai-config.ts y src/app/api/messages/trigger-ai-reply/route.ts
 // en ese repo) para que un mismo threadKey nunca reciba dos respuestas de IA
 // independientes: hoy el webhook "kapso" le pega directo a esta Lambda en
 // CADA mensaje entrante (sin pasar por el panel — ver README.md), mientras
-// que el panel dispara su propia respuesta (Groq) cuando un agente abre ese
-// mismo chat con el último mensaje sin responder. Ninguno de los dos sabía
-// del otro, y cada uno solo se protegía contra reintentos de SU PROPIO
-// camino (claimMessageId del lado de Groq, la caché de threadKey de este
-// archivo del lado de Gemini) — no había nada que impidiera a ambos
-// responderle al mismo mensaje del cliente por separado.
+// que el panel dispara su propia respuesta cuando un agente abre ese mismo
+// chat con el último mensaje sin responder. Esto seguía siendo un riesgo
+// real incluso después de migrar esta Lambda de Gemini a Groq (mismo
+// proveedor que ya usaba el panel): dos invocaciones independientes de Groq
+// respondiéndole al mismo mensaje es igual de problemático que uno de Gemini
+// y uno de Groq — ninguno de los dos caminos sabía del otro, y cada uno solo
+// se protegía contra reintentos de SU PROPIO camino (claimMessageId del lado
+// del panel, la caché de threadKey de este archivo del lado de esta Lambda)
+// — no había nada que impidiera a ambos responderle al mismo mensaje del
+// cliente por separado.
 //
 // Vive en la MISMA tabla "conversaciones-ai-config" (fila aparte, prefijo
 // "lock#" sobre el threadKey, para no chocar con la fila {threadKey,
@@ -219,8 +226,8 @@ const AI_REPLY_LOCK_PREFIX = 'lock#';
  * `true` si se obtuvo (nadie más lo tenía, o el que había ya expiró) — en
  * ese caso hay que liberarlo con liberarLockRespuestaIA() apenas se termine
  * de responder (o de fallar al intentarlo). Devuelve `false` si el otro
- * sistema (el panel, vía Groq) ya lo tiene tomado — en ese caso hay que
- * abortar sin llamarle a Gemini ni mandar nada.
+ * sistema (el panel) ya lo tiene tomado — en ese caso hay que abortar sin
+ * llamarle a Groq ni mandar nada.
  */
 async function adquirirLockRespuestaIA(threadKey) {
   const ahora = Date.now();
@@ -259,45 +266,68 @@ async function liberarLockRespuestaIA(threadKey) {
   }
 }
 
-// Limita el rol de la IA a consultas de la empresa: la API de Gemini
-// (generateContent, v1beta) acepta "systemInstruction" como campo separado
-// de "contents" — un Content de solo texto que no cuenta como turno del
-// historial. Se manda en cada llamada porque el endpoint es sin estado.
+// Migración de Gemini a Groq (mismo proveedor que ya usa el panel, ver
+// generateAIResponse en WhatsApp-Agentico/src/lib/ai-client.ts): este prompt
+// de sistema es una copia TEXTUAL del de ese archivo, a propósito — para que
+// ambos lados (panel y esta Lambda) respondan con el mismo tono ahora que
+// hablan con el mismo modelo. Si el de ai-client.ts cambia, hay que traer el
+// cambio acá también a mano (no hay ningún mecanismo que los mantenga
+// sincronizados automáticamente, son dos repos separados). A diferencia de
+// la API de Gemini (que aceptaba esto en un campo separado,
+// "systemInstruction"), el formato de OpenAI/Groq lo manda como un mensaje
+// más dentro de "messages", con role: "system", primero en la lista.
 const INSTRUCCION_SISTEMA =
-  'Eres un asistente de atención al cliente de esta empresa. Tu rol es ayudar ' +
-  'únicamente con consultas relacionadas con la empresa y su negocio (productos, ' +
-  'servicios, pedidos, horarios, precios, soporte, etc.). Si el cliente pregunta algo ' +
-  'que no tiene relación con la empresa (temas de cultura general, chistes, temas ' +
-  'personales u otros temas random), respóndele con amabilidad que no puedes ayudarle ' +
-  'con eso, y ofrécele ayuda con algo relacionado con la empresa en su lugar. No seas ' +
-  'cortante ni suenes robótico. ' +
-  'Responde siempre de forma breve: máximo 2-3 líneas por mensaje, sin párrafos largos. ' +
-  'Ve directo a la respuesta, sin introducciones ni relleno. No agregues sugerencias, ' +
-  'alternativas ni datos que el cliente no pidió (por ejemplo, no recomiendes otras ' +
-  'apps, servicios o webs externas). Si el tema requiere más detalle del que cabe en ' +
-  'pocas líneas, da lo esencial y ofrece seguir explicando si el cliente lo pide.';
+  'Eres un asistente de atención al cliente por WhatsApp. Responde en español, ' +
+  'de forma amable, clara y breve. No inventes información que no conozcas. ' +
+  'A continuación verás el historial reciente de esta conversación (mensajes ' +
+  'del cliente y tus propias respuestas anteriores) — úsalo para entender el ' +
+  'contexto. No vuelvas a saludar ("Hola", "Buenos días", etc.) si la ' +
+  'conversación ya estaba en curso; solo saluda si de verdad es el primer ' +
+  'mensaje del historial.';
 
-async function preguntarAGemini(apiKey, historial) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${apiKey}`;
+/**
+ * El historial se guarda (y se sigue guardando, sin migrar lo ya escrito en
+ * "conversaciones-whatsapp") en el formato que usaba Gemini —
+ * {role: 'user'|'model', parts: [{text}]} — así que acá se traduce al vuelo
+ * al formato {role, content} que espera la API de OpenAI/Groq, solo para
+ * armar este request puntual. 'model' (Gemini) se mapea a 'assistant'
+ * (OpenAI/Groq); 'user' se mantiene igual. Si un turno tuviera más de una
+ * "part" (no pasa hoy, pero por las dudas), se concatenan.
+ */
+function historialAFormatoGroq(historial) {
+  return historial.map((turno) => ({
+    role: turno.role === 'model' ? 'assistant' : 'user',
+    content: (turno.parts ?? []).map((parte) => parte.text ?? '').join(''),
+  }));
+}
+
+async function preguntarAGroq(apiKey, historial) {
+  const url = 'https://api.groq.com/openai/v1/chat/completions';
 
   for (let intento = 1; intento <= 3; intento++) {
     // Diagnóstico: visibilidad de en qué intento estamos y qué pasó en cada
     // uno, para saber si el fallback sale desde el primer intento o recién
     // después de agotar los 3 — sin esto, el log solo mostraba el texto
     // final de la respuesta (o del fallback), sin ninguna pista del motivo.
-    console.log(`Gemini: intento ${intento} de 3...`);
+    console.log(`Groq: intento ${intento} de 3...`);
 
     let data;
     let response;
     try {
       response = await fetchConTimeout(url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+        },
         body: JSON.stringify({
-          systemInstruction: { parts: [{ text: INSTRUCCION_SISTEMA }] },
-          contents: historial,
+          model: 'openai/gpt-oss-120b',
+          messages: [
+            { role: 'system', content: INSTRUCCION_SISTEMA },
+            ...historialAFormatoGroq(historial),
+          ],
         }),
-      }, GEMINI_TIMEOUT_MS);
+      }, GROQ_TIMEOUT_MS);
       data = await response.json();
     } catch (error) {
       // Se cortó por nuestro propio timeout (AbortError) o falló la red —
@@ -307,29 +337,35 @@ async function preguntarAGemini(apiKey, historial) {
       // Se responde el fallback ya, sin gastar los intentos restantes.
       const fueTimeoutPropio = error.name === 'AbortError';
       console.error(
-        `Gemini: intento ${intento} de 3 falló con excepción` +
-        (fueTimeoutPropio ? ` (TIMEOUT propio a los ${GEMINI_TIMEOUT_MS}ms, GEMINI_TIMEOUT_MS)` : ' (red u otro error, no fue nuestro timeout)') +
+        `Groq: intento ${intento} de 3 falló con excepción` +
+        (fueTimeoutPropio ? ` (TIMEOUT propio a los ${GROQ_TIMEOUT_MS}ms, GROQ_TIMEOUT_MS)` : ' (red u otro error, no fue nuestro timeout)') +
         ` — name=${error.name}, message=${error.message}`
       );
       return 'Lo siento, no pude generar una respuesta en este momento.';
     }
 
-    if (data.candidates?.[0]?.content?.parts?.[0]?.text) {
-      console.log(`Gemini: intento ${intento} de 3 OK (status HTTP ${response.status})`);
-      return data.candidates[0].content.parts[0].text;
+    if (data.choices?.[0]?.message?.content) {
+      console.log(`Groq: intento ${intento} de 3 OK (status HTTP ${response.status})`);
+      return data.choices[0].message.content;
     }
 
-    // Gemini respondió (no hubo excepción ni timeout) pero sin texto válido
-    // en candidates[0].content.parts[0].text — logueamos el status HTTP y el
-    // body completo para ver si vino un código de error (429, 503, ...) o
-    // algún motivo explícito de Google (p.ej. un bloqueo por safety, o
-    // finishReason distinto de STOP) antes de decidir si se reintenta.
+    // Groq respondió (no hubo excepción ni timeout) pero sin texto válido en
+    // choices[0].message.content — logueamos el status HTTP y el body
+    // completo para ver si vino un error (429, 503, ...) o algún motivo
+    // explícito (p.ej. finish_reason distinto de "stop") antes de decidir si
+    // se reintenta.
     console.error(
-      `Gemini: intento ${intento} de 3 sin texto válido — status HTTP ${response.status}, body=${JSON.stringify(data)}`
+      `Groq: intento ${intento} de 3 sin texto válido — status HTTP ${response.status}, body=${JSON.stringify(data)}`
     );
 
-    if (data.error?.code === 503 && intento < 3) {
-      console.log(`Gemini: intento ${intento} de 3 fue 503, esperando 1.5s antes de reintentar...`);
+    // A diferencia de Gemini (que traía un código numérico en
+    // data.error.code), el body de error de Groq no trae un código — solo
+    // {error: {message, type}} (p.ej. type: "service_unavailable_error") —
+    // así que el 503 que dispara el reintento se lee del STATUS HTTP de la
+    // respuesta, no del body. Confirmado contra la documentación oficial de
+    // Groq (console.groq.com/docs/errors) antes de implementar esto.
+    if (response.status === 503 && intento < 3) {
+      console.log(`Groq: intento ${intento} de 3 fue 503, esperando 1.5s antes de reintentar...`);
       await new Promise((resolve) => setTimeout(resolve, 1500));
       continue;
     }
@@ -392,7 +428,7 @@ export const handler = async (event) => {
 
     console.log(`Mensaje de ${numero}: "${textoRecibido}"`);
 
-    const geminiKey = await obtenerParametro('/whatsapp-agente/gemini-api-key');
+    const groqKey = await obtenerParametro('/whatsapp-agente/groq-api-key');
 
     const historialAnterior = await obtenerHistorial(numero);
 
@@ -401,25 +437,25 @@ export const handler = async (event) => {
       { role: 'user', parts: [{ text: textoRecibido }] },
     ];
 
-    // Corrección de "Gemini y Groq responden el mismo mensaje por separado":
-    // si el panel ya tiene el lock (está respondiendo este mismo threadKey
-    // por su propio camino, ver trigger-ai-reply en el otro repo), abortamos
-    // ACÁ, antes de llamarle a Gemini y de escribir cualquier fallback.
+    // Corrección de "esta Lambda y el panel responden el mismo mensaje por
+    // separado": si el panel ya tiene el lock (está respondiendo este mismo
+    // threadKey por su propio camino, ver trigger-ai-reply en el otro repo),
+    // abortamos ACÁ, antes de llamarle a Groq y de escribir cualquier fallback.
     if (!(await adquirirLockRespuestaIA(threadKey))) {
       console.log(`Lock de respuesta de IA ya tomado para threadKey=${threadKey} (probablemente el panel ya está respondiendo este mensaje)`);
       return { statusCode: 200, body: JSON.stringify({ status: 'lock_no_disponible' }) };
     }
 
     try {
-      const respuestaIA = await preguntarAGemini(geminiKey, historialActualizado);
-      console.log(`Respuesta de Gemini: "${respuestaIA}"`);
+      const respuestaIA = await preguntarAGroq(groqKey, historialActualizado);
+      console.log(`Respuesta de Groq: "${respuestaIA}"`);
 
       historialActualizado.push({ role: 'model', parts: [{ text: respuestaIA }] });
       await guardarHistorial(numero, historialActualizado);
 
       await enviarRespuestaWhatsApp(kapsoKey, phoneNumberId, numero, respuestaIA);
     } finally {
-      // Se libera tanto si se respondió bien como si preguntarAGemini,
+      // Se libera tanto si se respondió bien como si preguntarAGroq,
       // guardarHistorial o enviarRespuestaWhatsApp fallaron — para no dejar
       // el threadKey bloqueado 30s de más ante una falla real, bloqueando
       // sin necesidad el próximo mensaje genuino del cliente.
