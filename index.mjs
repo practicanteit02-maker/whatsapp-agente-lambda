@@ -1,6 +1,6 @@
 import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient, GetCommand, PutCommand } from '@aws-sdk/lib-dynamodb';
+import { DynamoDBDocumentClient, GetCommand, PutCommand, DeleteCommand } from '@aws-sdk/lib-dynamodb';
 
 const ssmClient = new SSMClient({});
 const dynamoClient = DynamoDBDocumentClient.from(new DynamoDBClient({}));
@@ -182,6 +182,83 @@ async function obtenerAiEnabled(threadKey) {
   }
 }
 
+// Lock compartido entre esta Lambda (Gemini) y WhatsApp-Agentico (Groq, ver
+// src/lib/chat-ai-config.ts y src/app/api/messages/trigger-ai-reply/route.ts
+// en ese repo) para que un mismo threadKey nunca reciba dos respuestas de IA
+// independientes: hoy el webhook "kapso" le pega directo a esta Lambda en
+// CADA mensaje entrante (sin pasar por el panel — ver README.md), mientras
+// que el panel dispara su propia respuesta (Groq) cuando un agente abre ese
+// mismo chat con el último mensaje sin responder. Ninguno de los dos sabía
+// del otro, y cada uno solo se protegía contra reintentos de SU PROPIO
+// camino (claimMessageId del lado de Groq, la caché de threadKey de este
+// archivo del lado de Gemini) — no había nada que impidiera a ambos
+// responderle al mismo mensaje del cliente por separado.
+//
+// Vive en la MISMA tabla "conversaciones-ai-config" (fila aparte, prefijo
+// "lock#" sobre el threadKey, para no chocar con la fila {threadKey,
+// aiEnabled} de ese chat) en vez de una tabla nueva, a pedido explícito —
+// ambos lados ya comparten esa tabla y ambos calculan el threadKey con el
+// mismo formato (ver construirThreadKey() acá arriba y threadKeyFor() en
+// src/lib/inbox-data.ts del panel: bsuid con prioridad si existe, si no el
+// teléfono con solo dígitos, seguido de ":" + phoneNumberId) — confirmado
+// carácter por carácter antes de implementar esto.
+//
+// El TTL nativo de DynamoDB (atributo `ttl`, si la tabla lo tiene habilitado)
+// se agrega solo como limpieza de fondo, NO como el mecanismo real de
+// expiración: ese TTL nativo puede tardar minutos u horas en barrer una fila
+// vencida, nada garantiza que lo haga a los 30s exactos. La expiración real
+// para el lock la hace la propia ConditionExpression de abajo, comparando
+// `expiresAt` (epoch en milisegundos) contra la hora actual — así que aunque
+// la fila del lock quede viva más tiempo del esperado, deja de bloquear a
+// nadie apenas pasan los 30s.
+const AI_REPLY_LOCK_TTL_MS = 30000;
+const AI_REPLY_LOCK_PREFIX = 'lock#';
+
+/**
+ * Intenta tomar el lock de respuesta de IA para este threadKey. Devuelve
+ * `true` si se obtuvo (nadie más lo tenía, o el que había ya expiró) — en
+ * ese caso hay que liberarlo con liberarLockRespuestaIA() apenas se termine
+ * de responder (o de fallar al intentarlo). Devuelve `false` si el otro
+ * sistema (el panel, vía Groq) ya lo tiene tomado — en ese caso hay que
+ * abortar sin llamarle a Gemini ni mandar nada.
+ */
+async function adquirirLockRespuestaIA(threadKey) {
+  const ahora = Date.now();
+  try {
+    await dynamoClient.send(new PutCommand({
+      TableName: NOMBRE_TABLA_CONFIG,
+      Item: {
+        threadKey: `${AI_REPLY_LOCK_PREFIX}${threadKey}`,
+        expiresAt: ahora + AI_REPLY_LOCK_TTL_MS,
+        ttl: Math.floor((ahora + AI_REPLY_LOCK_TTL_MS) / 1000),
+      },
+      ConditionExpression: 'attribute_not_exists(threadKey) OR expiresAt < :ahora',
+      ExpressionAttributeValues: { ':ahora': ahora },
+    }));
+    return true;
+  } catch (error) {
+    if (error.name === 'ConditionalCheckFailedException') return false;
+    // Falla de Dynamo en sí (no del lock): no le negamos la respuesta al
+    // cliente por un problema de infraestructura ajeno al lock — mismo
+    // criterio que ya usa obtenerAiEnabled() más arriba, pero acá el lado
+    // seguro es DEJAR pasar (en el peor caso, si el otro lado también falla
+    // igual, se duplica una respuesta en vez de no responder ninguna).
+    console.error('No se pudo adquirir el lock de respuesta de IA en DynamoDB:', error);
+    return true;
+  }
+}
+
+async function liberarLockRespuestaIA(threadKey) {
+  try {
+    await dynamoClient.send(new DeleteCommand({
+      TableName: NOMBRE_TABLA_CONFIG,
+      Key: { threadKey: `${AI_REPLY_LOCK_PREFIX}${threadKey}` },
+    }));
+  } catch (error) {
+    console.error('No se pudo liberar el lock de respuesta de IA en DynamoDB:', error);
+  }
+}
+
 // Limita el rol de la IA a consultas de la empresa: la API de Gemini
 // (generateContent, v1beta) acepta "systemInstruction" como campo separado
 // de "contents" — un Content de solo texto que no cuenta como turno del
@@ -301,13 +378,30 @@ export const handler = async (event) => {
       { role: 'user', parts: [{ text: textoRecibido }] },
     ];
 
-    const respuestaIA = await preguntarAGemini(geminiKey, historialActualizado);
-    console.log(`Respuesta de Gemini: "${respuestaIA}"`);
+    // Corrección de "Gemini y Groq responden el mismo mensaje por separado":
+    // si el panel ya tiene el lock (está respondiendo este mismo threadKey
+    // por su propio camino, ver trigger-ai-reply en el otro repo), abortamos
+    // ACÁ, antes de llamarle a Gemini y de escribir cualquier fallback.
+    if (!(await adquirirLockRespuestaIA(threadKey))) {
+      console.log(`Lock de respuesta de IA ya tomado para threadKey=${threadKey} (probablemente el panel ya está respondiendo este mensaje)`);
+      return { statusCode: 200, body: JSON.stringify({ status: 'lock_no_disponible' }) };
+    }
 
-    historialActualizado.push({ role: 'model', parts: [{ text: respuestaIA }] });
-    await guardarHistorial(numero, historialActualizado);
+    try {
+      const respuestaIA = await preguntarAGemini(geminiKey, historialActualizado);
+      console.log(`Respuesta de Gemini: "${respuestaIA}"`);
 
-    await enviarRespuestaWhatsApp(kapsoKey, phoneNumberId, numero, respuestaIA);
+      historialActualizado.push({ role: 'model', parts: [{ text: respuestaIA }] });
+      await guardarHistorial(numero, historialActualizado);
+
+      await enviarRespuestaWhatsApp(kapsoKey, phoneNumberId, numero, respuestaIA);
+    } finally {
+      // Se libera tanto si se respondió bien como si preguntarAGemini,
+      // guardarHistorial o enviarRespuestaWhatsApp fallaron — para no dejar
+      // el threadKey bloqueado 30s de más ante una falla real, bloqueando
+      // sin necesidad el próximo mensaje genuino del cliente.
+      await liberarLockRespuestaIA(threadKey);
+    }
 
     return { statusCode: 200, body: JSON.stringify({ status: 'respondido' }) };
   } catch (error) {
