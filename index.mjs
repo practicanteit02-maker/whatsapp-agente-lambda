@@ -8,6 +8,34 @@ const NOMBRE_TABLA = 'conversaciones-whatsapp';
 const NOMBRE_TABLA_CONFIG = 'conversaciones-ai-config';
 const MAX_MENSAJES_HISTORIAL = 10;
 
+// Corrección del bug "timeout de 30s + respuestas duplicadas": ninguna de
+// las 3 llamadas fetch() externas de este archivo (Kapso conversations.get,
+// Gemini, Kapso messages) tenía timeout propio — el fetch() global de Node
+// no lo tiene por defecto, así que si el servidor remoto no respondía (o
+// tardaba más de la cuenta), la función se quedaba esperando hasta que
+// Lambda la mataba a la fuerza en su propio límite (30s) sin haber llegado
+// a responderle nada ni a Kapso ni al cliente. Como Kapso además reintenta
+// el webhook si no recibe un 200 en 10s (ver
+// .agents/skills/integrate-whatsapp/references/webhooks-overview.md del
+// panel), un colgado de 30s ya alcanzaba para que Kapso disparara una
+// segunda invocación mucho antes — de ahí los duplicados.
+//
+// fetchConTimeout() corta cualquier fetch() a los FETCH_TIMEOUT_MS
+// configurados acá, con AbortController — la función falla rápido y puede
+// responder con el mensaje de fallback (o seguir con el teléfono solo en
+// resolverThreadKey) en vez de agotar el timeout completo de Lambda.
+const FETCH_TIMEOUT_MS = 8000;
+
+async function fetchConTimeout(url, options, timeoutMs = FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function obtenerParametro(nombre) {
   const command = new GetParameterCommand({ Name: nombre, WithDecryption: true });
   const response = await ssmClient.send(command);
@@ -87,7 +115,7 @@ function extraerBusinessScopedUserId(conversacion) {
 
 async function obtenerConversacion(kapsoKey, phoneNumberId, conversationId) {
   const url = `https://api.kapso.ai/meta/whatsapp/v24.0/${phoneNumberId}/conversations/${conversationId}`;
-  const response = await fetch(url, {
+  const response = await fetchConTimeout(url, {
     method: 'GET',
     headers: { 'X-API-Key': kapsoKey },
   });
@@ -167,15 +195,26 @@ async function preguntarAGemini(apiKey, historial) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${apiKey}`;
 
   for (let intento = 1; intento <= 3; intento++) {
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: INSTRUCCION_SISTEMA }] },
-        contents: historial,
-      }),
-    });
-    const data = await response.json();
+    let data;
+    try {
+      const response = await fetchConTimeout(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: INSTRUCCION_SISTEMA }] },
+          contents: historial,
+        }),
+      });
+      data = await response.json();
+    } catch (error) {
+      // Se cortó por nuestro propio timeout (AbortError) o falló la red —
+      // a diferencia del 503 de más abajo, acá NO se reintenta: si esta
+      // llamada ya tardó demasiado, reintentar solo vuelve a arriesgar el
+      // mismo presupuesto de tiempo que causó el timeout de 30s original.
+      // Se responde el fallback ya, sin gastar los intentos restantes.
+      console.error(`Gemini: intento ${intento} falló (timeout o red):`, error.message);
+      return 'Lo siento, no pude generar una respuesta en este momento.';
+    }
 
     if (data.candidates?.[0]?.content?.parts?.[0]?.text) {
       return data.candidates[0].content.parts[0].text;
@@ -192,7 +231,7 @@ async function preguntarAGemini(apiKey, historial) {
 
 async function enviarRespuestaWhatsApp(apiKey, phoneNumberId, numeroDestino, texto) {
   const url = `https://api.kapso.ai/meta/whatsapp/v24.0/${phoneNumberId}/messages`;
-  const response = await fetch(url, {
+  const response = await fetchConTimeout(url, {
     method: 'POST',
     headers: { 'X-API-Key': apiKey, 'Content-Type': 'application/json' },
     body: JSON.stringify({
