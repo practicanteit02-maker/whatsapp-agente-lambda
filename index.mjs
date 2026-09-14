@@ -24,7 +24,16 @@ const MAX_MENSAJES_HISTORIAL = 10;
 // configurados acá, con AbortController — la función falla rápido y puede
 // responder con el mensaje de fallback (o seguir con el teléfono solo en
 // resolverThreadKey) en vez de agotar el timeout completo de Lambda.
+//
+// Gemini tiene su propia cota más alta (GEMINI_TIMEOUT_MS): un incidente
+// real mostró que 8s le quedaba corto a Gemini incluso cuando SÍ iba a
+// responder — abortaba de más. Kapso (conversations.get y el envío del
+// mensaje) se queda en 8s porque nunca mostró ese problema y suele
+// responder rápido. Como un abort ya no reintenta (ver preguntarAGemini),
+// el peor caso de esa función sigue siendo un solo intento de 20s, no
+// 3×20s — la cuenta contra el timeout de 45s de la función sigue cerrando.
 const FETCH_TIMEOUT_MS = 8000;
+const GEMINI_TIMEOUT_MS = 20000;
 
 async function fetchConTimeout(url, options, timeoutMs = FETCH_TIMEOUT_MS) {
   const controller = new AbortController();
@@ -204,7 +213,7 @@ async function preguntarAGemini(apiKey, historial) {
           systemInstruction: { parts: [{ text: INSTRUCCION_SISTEMA }] },
           contents: historial,
         }),
-      });
+      }, GEMINI_TIMEOUT_MS);
       data = await response.json();
     } catch (error) {
       // Se cortó por nuestro propio timeout (AbortError) o falló la red —
