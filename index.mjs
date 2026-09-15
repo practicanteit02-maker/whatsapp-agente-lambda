@@ -266,24 +266,23 @@ async function liberarLockRespuestaIA(threadKey) {
   }
 }
 
-// Migración de Gemini a Groq (mismo proveedor que ya usa el panel, ver
-// generateAIResponse en WhatsApp-Agentico/src/lib/ai-client.ts): este prompt
-// de sistema es una copia TEXTUAL del de ese archivo, a propósito — para que
-// ambos lados (panel y esta Lambda) respondan con el mismo tono ahora que
-// hablan con el mismo modelo. Si el de ai-client.ts cambia, hay que traer el
-// cambio acá también a mano (no hay ningún mecanismo que los mantenga
-// sincronizados automáticamente, son dos repos separados). A diferencia de
-// la API de Gemini (que aceptaba esto en un campo separado,
-// "systemInstruction"), el formato de OpenAI/Groq lo manda como un mensaje
-// más dentro de "messages", con role: "system", primero en la lista.
-const INSTRUCCION_SISTEMA =
+// Funcionalidad "System prompt centralizado": el prompt de sistema vivía
+// duplicado a mano acá (INSTRUCCION_SISTEMA) y, por separado, como string
+// literal en WhatsApp-Agentico/src/lib/ai-client.ts — dos copias que había
+// que editar una por una y mantener idénticas de memoria, sin nada que
+// avisara si se desincronizaban. Ahora ambos repos leen el mismo ítem de la
+// tabla "configuracion-ia" en DynamoDB (clave `clave` = "system_prompt",
+// atributo `valor`) — ver obtenerSystemPrompt() más abajo, y el mismo
+// patrón del lado del panel en src/lib/system-prompt.ts.
+//
+// Este constante ahora es solo el RESPALDO: el texto tal como estaba antes
+// de centralizarlo, usado si la fila todavía no existe en DynamoDB o si la
+// lectura falla por cualquier motivo (permisos, tabla inexistente, etc.) —
+// fallar "abierto" con el último prompt conocido tiene más sentido acá que
+// fallar cerrado (dejar de responder del todo).
+const SYSTEM_PROMPT_FALLBACK =
   'Eres un asistente de atención al cliente por WhatsApp. Responde en español, ' +
   'de forma amable, clara y breve. No inventes información que no conozcas. ' +
-  // Restricción "solo temas de la empresa" — este texto debe ser IDÉNTICO al
-  // del system prompt en WhatsApp-Agentico/src/lib/ai-client.ts (repo
-  // aparte), para que el bot se comporte igual sin importar cuál de los dos
-  // sistemas responda (ambos usan Groq). Si se edita acá, hay que editarlo a
-  // mano también del otro lado — no hay nada que los sincronice.
   'Solo debes responder preguntas relacionadas con la empresa: sus productos ' +
   'o servicios, pedidos, catálogo, precios, envíos, o soporte al cliente. Si ' +
   'el cliente pregunta algo que no tiene relación con la empresa (temas ' +
@@ -295,6 +294,46 @@ const INSTRUCCION_SISTEMA =
   'contexto. No vuelvas a saludar ("Hola", "Buenos días", etc.) si la ' +
   'conversación ya estaba en curso; solo saluda si de verdad es el primer ' +
   'mensaje del historial.';
+
+const NOMBRE_TABLA_CONFIG_IA = 'configuracion-ia';
+const CLAVE_SYSTEM_PROMPT = 'system_prompt';
+// Mismo orden de magnitud que THREAD_KEY_CACHE_TTL_MS de arriba, pero un
+// poco más largo: el prompt cambia con mucha menos frecuencia que la zona de
+// un chat, así que no hace falta refrescarlo tan seguido.
+const SYSTEM_PROMPT_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutos
+
+// Caché en memoria a nivel de módulo — mismo patrón que threadKeyCache: una
+// variable simple alcanza (a diferencia del lado del panel, esta Lambda no
+// tiene el problema de recarga de módulos de Turbopack en desarrollo, así
+// que no hace falta guardarlo en algo tipo globalThis).
+let systemPromptCache = null; // { valor, cachedAt } | null
+
+/**
+ * Prompt de sistema vigente para preguntarAGroq — de la caché si no venció,
+ * si no de "configuracion-ia" en DynamoDB (y ahí se cachea), y si la
+ * consulta falla o la fila no existe todavía, del respaldo hardcodeado de
+ * arriba.
+ */
+async function obtenerSystemPrompt() {
+  if (systemPromptCache && Date.now() - systemPromptCache.cachedAt < SYSTEM_PROMPT_CACHE_TTL_MS) {
+    return systemPromptCache.valor;
+  }
+
+  try {
+    const response = await dynamoClient.send(new GetCommand({
+      TableName: NOMBRE_TABLA_CONFIG_IA,
+      Key: { clave: CLAVE_SYSTEM_PROMPT },
+    }));
+    const valor = typeof response.Item?.valor === 'string' && response.Item.valor.trim()
+      ? response.Item.valor
+      : SYSTEM_PROMPT_FALLBACK;
+    systemPromptCache = { valor, cachedAt: Date.now() };
+    return valor;
+  } catch (error) {
+    console.error('No se pudo leer "configuracion-ia" en DynamoDB, usando el prompt de respaldo:', error);
+    return SYSTEM_PROMPT_FALLBACK;
+  }
+}
 
 /**
  * El historial se guarda (y se sigue guardando, sin migrar lo ya escrito en
@@ -314,6 +353,10 @@ function historialAFormatoGroq(historial) {
 
 async function preguntarAGroq(apiKey, historial) {
   const url = 'https://api.groq.com/openai/v1/chat/completions';
+  // Se pide una sola vez antes del loop de reintentos (no adentro), aunque
+  // esté cacheado igual — no tiene sentido repetir la lectura/chequeo del
+  // caché en cada intento del mismo mensaje.
+  const systemPrompt = await obtenerSystemPrompt();
 
   for (let intento = 1; intento <= 3; intento++) {
     // Diagnóstico: visibilidad de en qué intento estamos y qué pasó en cada
@@ -334,7 +377,7 @@ async function preguntarAGroq(apiKey, historial) {
         body: JSON.stringify({
           model: 'openai/gpt-oss-120b',
           messages: [
-            { role: 'system', content: INSTRUCCION_SISTEMA },
+            { role: 'system', content: systemPrompt },
             ...historialAFormatoGroq(historial),
           ],
         }),
