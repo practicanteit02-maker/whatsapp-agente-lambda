@@ -226,6 +226,11 @@ const AI_REPLY_LOCK_TTL_MS = 30000;
 const AI_REPLY_LOCK_PREFIX = 'lock#';
 
 /**
+ * Exportada (junto con liberarLockRespuestaIA) solo para que test/lock.test.mjs
+ * pueda importarla y probarla directamente, mockeando
+ * DynamoDBDocumentClient.prototype.send — el handler exportado (más abajo)
+ * sigue siendo el único punto de entrada real de la Lambda.
+ *
  * Intenta tomar el lock de respuesta de IA para este threadKey. Devuelve
  * `true` si se obtuvo (nadie más lo tenía, o el que había ya expiró) — en
  * ese caso hay que liberarlo con liberarLockRespuestaIA() apenas se termine
@@ -233,7 +238,7 @@ const AI_REPLY_LOCK_PREFIX = 'lock#';
  * sistema (el panel) ya lo tiene tomado — en ese caso hay que abortar sin
  * llamarle a Groq ni mandar nada.
  */
-async function adquirirLockRespuestaIA(threadKey) {
+export async function adquirirLockRespuestaIA(threadKey) {
   const ahora = Date.now();
   try {
     await dynamoClient.send(new PutCommand({
@@ -259,7 +264,7 @@ async function adquirirLockRespuestaIA(threadKey) {
   }
 }
 
-async function liberarLockRespuestaIA(threadKey) {
+export async function liberarLockRespuestaIA(threadKey) {
   try {
     await dynamoClient.send(new DeleteCommand({
       TableName: NOMBRE_TABLA_LOCKS,

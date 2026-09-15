@@ -1,0 +1,13 @@
+{
+  "name": "whatsapp-agente-lambda",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "@aws-sdk/client-dynamodb": "^3.1127.0",
+    "@aws-sdk/client-ssm": "^3.1127.0",
+    "@aws-sdk/lib-dynamodb": "^3.1127.0"
+  }
+}

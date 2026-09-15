@@ -17,7 +17,12 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Empaquetar función
-        run: zip -r function.zip . -x "*.git*" -x ".github/*"
+        # Excluye los tests (test/*, ver package.json) y todo lo que solo
+        # existe para poder correrlos en local/CI (node_modules,
+        # package.json, package-lock.json) — la Lambda en producción sigue
+        # recibiendo el SDK de AWS del propio runtime, no de node_modules, así
+        # que ninguno de estos archivos hace falta en el zip desplegado.
+        run: zip -r function.zip . -x "*.git*" -x ".github/*" -x "test/*" -x "node_modules/*" -x "package.json" -x "package-lock.json"
         
       - name: Configurar credenciales AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
