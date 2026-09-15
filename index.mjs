@@ -201,14 +201,17 @@ async function obtenerAiEnabled(threadKey) {
 // — no había nada que impidiera a ambos responderle al mismo mensaje del
 // cliente por separado.
 //
-// Vive en la MISMA tabla "conversaciones-ai-config" (fila aparte, prefijo
-// "lock#" sobre el threadKey, para no chocar con la fila {threadKey,
-// aiEnabled} de ese chat) en vez de una tabla nueva, a pedido explícito —
-// ambos lados ya comparten esa tabla y ambos calculan el threadKey con el
-// mismo formato (ver construirThreadKey() acá arriba y threadKeyFor() en
-// src/lib/inbox-data.ts del panel: bsuid con prioridad si existe, si no el
-// teléfono con solo dígitos, seguido de ":" + phoneNumberId) — confirmado
-// carácter por carácter antes de implementar esto.
+// Vive en su propia tabla, "locks-respuesta-ia" (clave `threadKey`) — antes
+// vivía como fila aparte dentro de "conversaciones-ai-config" (prefijo
+// "lock#", para no chocar con la fila {threadKey, aiEnabled} de ese chat),
+// pero eso contaminaba el Scan completo que hace getAllAiEnabled() del lado
+// del panel con filas de lock transitorias; una tabla dedicada lo evita. El
+// prefijo "lock#" se mantuvo tal cual al mover esto (ya no hace falta en una
+// tabla propia, pero sacarlo no era parte de este cambio). Ambos lados
+// calculan el threadKey con el mismo formato (ver construirThreadKey() acá
+// arriba y threadKeyFor() en src/lib/inbox-data.ts del panel: bsuid con
+// prioridad si existe, si no el teléfono con solo dígitos, seguido de ":" +
+// phoneNumberId) — confirmado carácter por carácter antes de implementar esto.
 //
 // El TTL nativo de DynamoDB (atributo `ttl`, si la tabla lo tiene habilitado)
 // se agrega solo como limpieza de fondo, NO como el mecanismo real de
@@ -218,6 +221,7 @@ async function obtenerAiEnabled(threadKey) {
 // `expiresAt` (epoch en milisegundos) contra la hora actual — así que aunque
 // la fila del lock quede viva más tiempo del esperado, deja de bloquear a
 // nadie apenas pasan los 30s.
+const NOMBRE_TABLA_LOCKS = 'locks-respuesta-ia';
 const AI_REPLY_LOCK_TTL_MS = 30000;
 const AI_REPLY_LOCK_PREFIX = 'lock#';
 
@@ -233,7 +237,7 @@ async function adquirirLockRespuestaIA(threadKey) {
   const ahora = Date.now();
   try {
     await dynamoClient.send(new PutCommand({
-      TableName: NOMBRE_TABLA_CONFIG,
+      TableName: NOMBRE_TABLA_LOCKS,
       Item: {
         threadKey: `${AI_REPLY_LOCK_PREFIX}${threadKey}`,
         expiresAt: ahora + AI_REPLY_LOCK_TTL_MS,
@@ -258,7 +262,7 @@ async function adquirirLockRespuestaIA(threadKey) {
 async function liberarLockRespuestaIA(threadKey) {
   try {
     await dynamoClient.send(new DeleteCommand({
-      TableName: NOMBRE_TABLA_CONFIG,
+      TableName: NOMBRE_TABLA_LOCKS,
       Key: { threadKey: `${AI_REPLY_LOCK_PREFIX}${threadKey}` },
     }));
   } catch (error) {
